@@ -1,6 +1,7 @@
-use std::error::Error;
+use std::{error::Error, path::PathBuf};
 
-use serde::Deserialize;
+use clap::{command, Parser, Subcommand};
+use serde::{de::DeserializeOwned, Deserialize};
 
 // TODO does the following matter
 //     By default, struct field names are deserialized based on the position of
@@ -21,12 +22,62 @@ struct MapRecord {
     sp_id: String,
 }
 
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Map {
+        /// .csv file containing songs from your library
+        #[arg(value_name = "LIBRARY_FILE")]
+        lib_path: PathBuf,
+        /// .csv file containing mappings from songs to spotify songs
+        #[arg(value_name = "MAP_FILE")]
+        map_path: PathBuf,
+    },
+    Check {
+        /// .csv file containing mappings from songs to spotify songs
+        #[arg(value_name = "MAP_FILE")]
+        map_path: PathBuf,
+    },
+    Upload {
+        /// .csv file containing mappings from songs to spotify songs
+        #[arg(value_name = "MAP_FILE")]
+        map_path: PathBuf,
+    },
+}
+
+fn collect_csv<T: DeserializeOwned>(path: PathBuf) -> Result<Vec<T>, csv::Error> {
+    let rdr = csv::Reader::from_path(path)?;
+    rdr.into_deserialize()
+        .collect::<Result<Vec<T>, csv::Error>>()
+}
+
+fn map(lib_path: PathBuf, map_path: PathBuf) -> Result<(), Box<dyn Error>> {
+    let lib: Vec<LibRecord> = collect_csv(lib_path)?;
+    let map: Vec<MapRecord> = collect_csv(map_path)?;
+    todo!();
+}
+
+fn check(map_path: PathBuf) -> Result<(), Box<dyn Error>> {
+    let map: Vec<MapRecord> = collect_csv(map_path)?;
+    todo!();
+}
+
+fn upload(map_path: PathBuf) -> Result<(), Box<dyn Error>> {
+    let map: Vec<MapRecord> = collect_csv(map_path)?;
+    todo!();
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let path = "bruh";
-    let mut rdr = csv::Reader::from_path(path)?;
-    for result in rdr.deserialize() {
-        let record: LibRecord = result?;
-        println!("{:?}", record);
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Map { lib_path, map_path } => map(lib_path, map_path),
+        Commands::Check { map_path } => check(map_path),
+        Commands::Upload { map_path } => upload(map_path),
     }
-    Ok(())
 }
