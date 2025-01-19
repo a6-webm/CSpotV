@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     fs,
     io::{self, Write},
     path::PathBuf,
@@ -8,19 +7,28 @@ use std::{
 use clap::{command, Parser, Subcommand};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use spotify_rs::{
-    model::search::Item, AuthCodeClient, AuthCodeFlow, ClientCredsClient, ClientCredsFlow,
-    RedirectUrl,
+    auth::{NoVerifier, Token},
+    client::Client,
+    model::search::Item,
+    AuthCodeClient, AuthCodeFlow, ClientCredsClient, ClientCredsFlow, RedirectUrl,
 };
-
-// TODO does the following matter
-//     By default, struct field names are deserialized based on the position of
-//     a corresponding field in the CSV data's header record.
 
 #[derive(Debug, Deserialize)]
 struct LibRecord {
     name: String,
     album: String,
     artist: String,
+}
+
+impl LibRecord {
+    fn to_map_record<T: Into<String>>(self, sp_id: T) -> MapRecord {
+        MapRecord {
+            name: self.name,
+            album: self.album,
+            artist: self.artist,
+            sp_id: sp_id.into(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,17 +68,22 @@ enum Commands {
     },
 }
 
-fn collect_csv<T: DeserializeOwned>(path: &PathBuf) -> Result<Vec<T>, csv::Error> {
+fn collect_csv<T: DeserializeOwned>(path: &PathBuf) -> anyhow::Result<Vec<T>> {
     let rdr = csv::Reader::from_path(path)?;
-    rdr.into_deserialize()
-        .collect::<Result<Vec<T>, csv::Error>>()
+    Ok(rdr
+        .into_deserialize()
+        .collect::<Result<Vec<T>, csv::Error>>()?)
 }
 
 fn metadata_match(map_r: &MapRecord, lib_r: &LibRecord) -> bool {
     map_r.name == lib_r.name && map_r.album == lib_r.album && map_r.artist == lib_r.artist
 }
 
-async fn map(lib_path: PathBuf, map_path: PathBuf) -> Result<(), Box<dyn Error>> {
+async fn map(
+    lib_path: PathBuf,
+    map_path: PathBuf,
+    mut cred_sp: Client<Token, ClientCredsFlow, NoVerifier>,
+) -> anyhow::Result<()> {
     let lib: Vec<LibRecord> = collect_csv(&lib_path)?;
     let mut map: Vec<(MapRecord, bool)> = if map_path.exists() {
         collect_csv(&map_path)?
@@ -82,6 +95,7 @@ async fn map(lib_path: PathBuf, map_path: PathBuf) -> Result<(), Box<dyn Error>>
     };
 
     for lib_r in lib {
+        // if lib_r already present in map
         if let Some(map_r) = map
             .iter_mut()
             .find(|map_r| metadata_match(&map_r.0, &lib_r))
@@ -89,7 +103,27 @@ async fn map(lib_path: PathBuf, map_path: PathBuf) -> Result<(), Box<dyn Error>>
             map_r.1 = true;
             continue;
         }
-        // TODO lib_r not found in map, so add it to the map by searching for stuff on spotify
+        // else add lib_r to map
+        // TODO is there an error if the query contains a colon?
+        let search_results = cred_sp
+            .search(
+                format!(
+                    "track:{} album:{} artist:{}",
+                    lib_r.name, lib_r.album, lib_r.artist
+                ),
+                &[Item::Track],
+            )
+            .market("GB")
+            .limit(5)
+            .get()
+            .await?
+            .tracks;
+        let Some(search_results) = search_results else {
+            map.push((lib_r.to_map_record("Not found"), true));
+            continue;
+        };
+        println!("Pick a track to match:");
+        // TODO
     }
 
     // Remove entries from map that are not present in lib
@@ -101,8 +135,6 @@ async fn map(lib_path: PathBuf, map_path: PathBuf) -> Result<(), Box<dyn Error>>
     map.sort_by_key(|m_r| m_r.album.clone());
     map.sort_by_key(|m_r| m_r.artist.clone());
 
-    fs::remove_file(&map_path)?;
-    fs::File::create(&map_path)?;
     let mut wtr = csv::Writer::from_path(&map_path)?;
     for map_r in map.into_iter() {
         wtr.serialize(map_r)?;
@@ -111,18 +143,25 @@ async fn map(lib_path: PathBuf, map_path: PathBuf) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-async fn check(map_path: PathBuf) -> Result<(), Box<dyn Error>> {
+async fn check(
+    map_path: PathBuf,
+    cred_sp: Client<Token, ClientCredsFlow, NoVerifier>,
+) -> anyhow::Result<()> {
     let map: Vec<MapRecord> = collect_csv(&map_path)?;
     todo!()
 }
 
-async fn upload(map_path: PathBuf) -> Result<(), Box<dyn Error>> {
+async fn upload(
+    map_path: PathBuf,
+    cred_sp: Client<Token, ClientCredsFlow, NoVerifier>,
+    authc_sp: Client<Token, AuthCodeFlow, NoVerifier>,
+) -> anyhow::Result<()> {
     let map: Vec<MapRecord> = collect_csv(&map_path)?;
     todo!()
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> anyhow::Result<()> {
     // TODO make errors not look like ass
     let cli = Cli::parse();
 
@@ -139,11 +178,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "fed3e6de8e3e4fe481b4020cdb72342e",
         fs::read_to_string("client_secret.txt")?.trim(),
     );
-    let mut cred_sp = ClientCredsClient::authenticate(client_creds_flow).await?;
+    let cred_sp = ClientCredsClient::authenticate(client_creds_flow).await?;
 
     let (auth_client, url) = AuthCodeClient::new(auth_code_flow, redirect_url, auto_refresh);
     println!("Enter the following url into a browser:\n\n\t{}\n", url);
     // TODO store the auth stuff and only refresh it if its invalid
+    // TODO use webbrowser crate to automatically open the url
     print!("Then paste the resuting localhost url here: ");
     io::stdout().flush()?;
     let mut auth_url = String::new();
@@ -152,24 +192,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let split: Vec<&str> = auth_url.trim().split(['=', '&']).collect();
     let auth_code = split[1].to_owned();
     let csrf_token = split[3].to_owned();
-    let mut authc_sp = auth_client.authenticate(auth_code, csrf_token).await?;
+    let authc_sp = auth_client.authenticate(auth_code, csrf_token).await?;
 
-    dbg!(cred_sp
-        .search("track:you are my sunshine", &[Item::Track])
-        .market("GB")
-        .limit(5)
-        .get()
-        .await?
-        .tracks
-        .unwrap()
-        .items[0]
-        .id
-        .clone());
+    // dbg!(
+    //     cred_sp
+    //         .search("track::) artist:japanese", &[Item::Track])
+    //         .market("GB")
+    //         .limit(5)
+    //         .get()
+    //         .await?
+    //         .tracks
+    //         .unwrap()
+    //         .items
+    // );
 
     // TODO use console, dialoguer and indicatif crates
     match cli.command {
-        Commands::Map { lib_path, map_path } => map(lib_path, map_path).await,
-        Commands::Check { map_path } => check(map_path).await,
-        Commands::Upload { map_path } => upload(map_path).await,
-    }
+        Commands::Map { lib_path, map_path } => map(lib_path, map_path, cred_sp).await,
+        Commands::Check { map_path } => check(map_path, cred_sp).await,
+        Commands::Upload { map_path } => upload(map_path, cred_sp, authc_sp).await,
+    }?;
+    Ok(())
 }
