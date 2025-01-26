@@ -6,11 +6,12 @@ use std::{
 
 use anyhow::Context;
 use clap::{command, Parser, Subcommand};
+use log::{info, warn};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use spotify_rs::{
     auth::{NoVerifier, Token},
     client::Client,
-    model::search::Item,
+    model::{search::Item, track::Track},
     AuthCodeClient, AuthCodeFlow, ClientCredsClient, ClientCredsFlow, RedirectUrl,
 };
 
@@ -22,11 +23,11 @@ struct LibRecord {
 }
 
 impl LibRecord {
-    fn to_map_record<T: Into<String>>(self, sp_id: T) -> MapRecord {
+    fn to_map_record<T: Into<String>>(&self, sp_id: T) -> MapRecord {
         MapRecord {
-            name: self.name,
-            album: self.album,
-            artist: self.artist,
+            name: self.name.to_owned(),
+            album: self.album.to_owned(),
+            artist: self.artist.to_owned(),
             sp_id: sp_id.into(),
         }
     }
@@ -103,6 +104,22 @@ fn search_str(lib_r: &LibRecord) -> String {
     out
 }
 
+fn print_track(track: &Track) {
+    println!("Name: {}", track.name);
+    println!("Album: {}", track.album.name);
+    let artists: Vec<String> = track
+        .artists
+        .iter()
+        .map(|artist| artist.name.to_owned())
+        .collect();
+    if artists.len() == 1 {
+        println!("Artist: {}", artists[0]);
+    } else {
+        println!("Artist: {:?}", artists);
+    }
+    println!("Date: {}", track.album.release_date);
+}
+
 async fn map(
     lib_path: PathBuf,
     map_path: PathBuf,
@@ -122,20 +139,31 @@ async fn map(
         Vec::new()
     };
 
-    for lib_r in lib {
-        // TODO handle empty records
+    for (lib_index, lib_r) in lib.iter().enumerate() {
+        if lib_r.name.trim().is_empty() {
+            warn!(
+                "line {lib_index} in {} has empty Name field",
+                lib_path.file_name().unwrap().to_string_lossy()
+            );
+            continue;
+        }
         // if lib_r already present in map
         if let Some(map_r) = map
             .iter_mut()
             .find(|map_r| metadata_match(&map_r.m_r, &lib_r))
         {
+            info!(
+                "line {lib_index}, \"{}\" already present in map",
+                map_r.m_r.name
+            );
             map_r.keep = true;
             continue;
         }
         // else add lib_r to map
         // TODO is there an error if the query contains a colon? (generally do we/how do we escape stuff)
+        // TODO info abt searching
         let search_results = cred_sp
-            .search(dbg!(search_str(&lib_r)), &[Item::Track])
+            .search(search_str(&lib_r), &[Item::Track])
             .market("GB")
             .limit(5)
             .get()
@@ -147,19 +175,19 @@ async fn map(
                 m_r: lib_r.to_map_record("Not found"),
                 keep: true,
             });
+            warn!("line {lib_index}, \"{}\" not found on spotify", lib_r.name);
             continue;
         }
         for (i, item) in search_results.items.iter().enumerate() {
-            println!("Item {}", i + 1);
-            println!("{:?}", item); // TODO better print
+            println!("Search result {}", i + 1);
+            print_track(item);
+            println!();
         }
-        print!(
-            r#"Pick a track to match, "1"-"{}" or "n" for none: "#,
-            search_results.items.len()
-        );
+        print!("Pick a track to match (#/n): ");
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
+        println!("\n");
         answer = answer.trim().to_owned();
         if answer == "n" {
             map.push(R {
@@ -169,6 +197,7 @@ async fn map(
             continue;
         }
         let index = answer.parse::<usize>()? - 1;
+        // TODO info abt this
         map.push(R {
             m_r: lib_r.to_map_record(search_results.items[index].id.clone()),
             keep: true,
@@ -176,6 +205,7 @@ async fn map(
     }
 
     // Remove entries from map that are not present in lib
+    // TODO warn abt these
     let mut map: Vec<MapRecord> = map
         .into_iter()
         .filter_map(|m_r| if m_r.keep { Some(m_r.m_r) } else { None })
@@ -211,6 +241,7 @@ async fn upload(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    colog::init();
     // TODO make errors not look like ass
     let cli = Cli::parse();
 
@@ -237,22 +268,11 @@ async fn main() -> anyhow::Result<()> {
     io::stdout().flush()?;
     let mut auth_url = String::new();
     io::stdin().read_line(&mut auth_url)?;
+    println!("\n");
     let split: Vec<&str> = auth_url.trim().split(['=', '&']).collect();
     let auth_code = split[1].to_owned();
     let csrf_token = split[3].to_owned();
     let authc_sp = auth_client.authenticate(auth_code, csrf_token).await?;
-
-    // dbg!(
-    //     cred_sp
-    //         .search("track::) artist:japanese", &[Item::Track])
-    //         .market("GB")
-    //         .limit(5)
-    //         .get()
-    //         .await?
-    //         .tracks
-    //         .unwrap()
-    //         .items
-    // );
 
     // TODO use console, dialoguer and indicatif crates
     match cli.command {
