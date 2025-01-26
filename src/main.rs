@@ -4,6 +4,7 @@ use std::{
     path::PathBuf,
 };
 
+use anyhow::Context;
 use clap::{command, Parser, Subcommand};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use spotify_rs::{
@@ -79,57 +80,105 @@ fn metadata_match(map_r: &MapRecord, lib_r: &LibRecord) -> bool {
     map_r.name == lib_r.name && map_r.album == lib_r.album && map_r.artist == lib_r.artist
 }
 
+fn search_str(lib_r: &LibRecord) -> String {
+    let mut out = String::new();
+    if !lib_r.name.trim().is_empty() {
+        out += "track:";
+        out += &lib_r.name;
+        out += " ";
+    }
+    if !lib_r.album.trim().is_empty() {
+        out += "album:";
+        out += &lib_r.album;
+        out += " ";
+    }
+    if !lib_r.artist.trim().is_empty() {
+        out += "artist:";
+        out += &lib_r.artist;
+        out += " ";
+    }
+    if !out.is_empty() {
+        out.remove(out.len() - 1);
+    }
+    out
+}
+
 async fn map(
     lib_path: PathBuf,
     map_path: PathBuf,
     mut cred_sp: Client<Token, ClientCredsFlow, NoVerifier>,
 ) -> anyhow::Result<()> {
+    struct R {
+        m_r: MapRecord,
+        keep: bool,
+    }
     let lib: Vec<LibRecord> = collect_csv(&lib_path)?;
-    let mut map: Vec<(MapRecord, bool)> = if map_path.exists() {
+    let mut map: Vec<R> = if map_path.exists() {
         collect_csv(&map_path)?
             .into_iter()
-            .map(|m_r| (m_r, false))
+            .map(|m_r| R { m_r, keep: false })
             .collect()
     } else {
         Vec::new()
     };
 
     for lib_r in lib {
+        // TODO handle empty records
         // if lib_r already present in map
         if let Some(map_r) = map
             .iter_mut()
-            .find(|map_r| metadata_match(&map_r.0, &lib_r))
+            .find(|map_r| metadata_match(&map_r.m_r, &lib_r))
         {
-            map_r.1 = true;
+            map_r.keep = true;
             continue;
         }
         // else add lib_r to map
-        // TODO is there an error if the query contains a colon?
+        // TODO is there an error if the query contains a colon? (generally do we/how do we escape stuff)
         let search_results = cred_sp
-            .search(
-                format!(
-                    "track:{} album:{} artist:{}",
-                    lib_r.name, lib_r.album, lib_r.artist
-                ),
-                &[Item::Track],
-            )
+            .search(dbg!(search_str(&lib_r)), &[Item::Track])
             .market("GB")
             .limit(5)
             .get()
             .await?
-            .tracks;
-        let Some(search_results) = search_results else {
-            map.push((lib_r.to_map_record("Not found"), true));
+            .tracks
+            .with_context(|| "spotify search failed")?;
+        if search_results.items.is_empty() {
+            map.push(R {
+                m_r: lib_r.to_map_record("Not found"),
+                keep: true,
+            });
             continue;
-        };
-        println!("Pick a track to match:");
-        // TODO
+        }
+        for (i, item) in search_results.items.iter().enumerate() {
+            println!("Item {}", i + 1);
+            println!("{:?}", item); // TODO better print
+        }
+        print!(
+            r#"Pick a track to match, "1"-"{}" or "n" for none: "#,
+            search_results.items.len()
+        );
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        answer = answer.trim().to_owned();
+        if answer == "n" {
+            map.push(R {
+                m_r: lib_r.to_map_record("Not found"),
+                keep: true,
+            });
+            continue;
+        }
+        let index = answer.parse::<usize>()? - 1;
+        map.push(R {
+            m_r: lib_r.to_map_record(search_results.items[index].id.clone()),
+            keep: true,
+        });
     }
 
     // Remove entries from map that are not present in lib
     let mut map: Vec<MapRecord> = map
         .into_iter()
-        .filter_map(|m_r| if m_r.1 { Some(m_r.0) } else { None })
+        .filter_map(|m_r| if m_r.keep { Some(m_r.m_r) } else { None })
         .collect();
     map.sort_by_key(|m_r| m_r.name.clone());
     map.sort_by_key(|m_r| m_r.album.clone());
@@ -144,19 +193,19 @@ async fn map(
 }
 
 async fn check(
-    map_path: PathBuf,
-    cred_sp: Client<Token, ClientCredsFlow, NoVerifier>,
+    _map_path: PathBuf,
+    _cred_sp: Client<Token, ClientCredsFlow, NoVerifier>,
 ) -> anyhow::Result<()> {
-    let map: Vec<MapRecord> = collect_csv(&map_path)?;
+    // let map: Vec<MapRecord> = collect_csv(&map_path)?;
     todo!()
 }
 
 async fn upload(
-    map_path: PathBuf,
-    cred_sp: Client<Token, ClientCredsFlow, NoVerifier>,
-    authc_sp: Client<Token, AuthCodeFlow, NoVerifier>,
+    _map_path: PathBuf,
+    _cred_sp: Client<Token, ClientCredsFlow, NoVerifier>,
+    _authc_sp: Client<Token, AuthCodeFlow, NoVerifier>,
 ) -> anyhow::Result<()> {
-    let map: Vec<MapRecord> = collect_csv(&map_path)?;
+    // let map: Vec<MapRecord> = collect_csv(&map_path)?;
     todo!()
 }
 
@@ -187,8 +236,7 @@ async fn main() -> anyhow::Result<()> {
     print!("Then paste the resuting localhost url here: ");
     io::stdout().flush()?;
     let mut auth_url = String::new();
-    let stdin = io::stdin();
-    stdin.read_line(&mut auth_url)?;
+    io::stdin().read_line(&mut auth_url)?;
     let split: Vec<&str> = auth_url.trim().split(['=', '&']).collect();
     let auth_code = split[1].to_owned();
     let csrf_token = split[3].to_owned();
