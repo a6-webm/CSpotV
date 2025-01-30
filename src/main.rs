@@ -1,4 +1,5 @@
 use std::{
+    fmt::Display,
     fs,
     io::{self, Write},
     path::PathBuf,
@@ -15,31 +16,8 @@ use spotify_rs::{
     AuthCodeClient, AuthCodeFlow, ClientCredsClient, ClientCredsFlow, RedirectUrl,
 };
 
-#[derive(Debug, Deserialize)]
-struct LibRecord {
-    name: String,
-    album: String,
-    artist: String,
-}
-
-impl LibRecord {
-    fn to_map_record<T: Into<String>>(&self, sp_id: T) -> MapRecord {
-        MapRecord {
-            name: self.name.to_owned(),
-            album: self.album.to_owned(),
-            artist: self.artist.to_owned(),
-            sp_id: sp_id.into(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct MapRecord {
-    name: String,
-    album: String,
-    artist: String,
-    sp_id: String,
-}
+const CLIENT_ID: &str = "fed3e6de8e3e4fe481b4020cdb72342e";
+const CLIENT_SECRET_PATH: &str = "client_secret.txt";
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -70,38 +48,76 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Deserialize)]
+struct LibRecord {
+    name: String,
+    album: String,
+    artist: String,
+}
+
+impl Display for LibRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Name: {}\nAlbum: {}\nArtist: {}",
+            self.name, self.album, self.artist
+        )
+    }
+}
+
+impl LibRecord {
+    fn to_map_record<T: Into<String>>(&self, sp_id: T) -> MapRecord {
+        MapRecord {
+            name: self.name.to_owned(),
+            album: self.album.to_owned(),
+            artist: self.artist.to_owned(),
+            sp_id: sp_id.into(),
+        }
+    }
+
+    fn search_str(&self) -> String {
+        let mut out = String::new();
+        if !self.name.trim().is_empty() {
+            out += "track:";
+            out += &self.name;
+            out += " ";
+        }
+        if !self.album.trim().is_empty() {
+            out += "album:";
+            out += &self.album;
+            out += " ";
+        }
+        if !self.artist.trim().is_empty() {
+            out += "artist:";
+            out += &self.artist;
+            out += " ";
+        }
+        if !out.is_empty() {
+            out.remove(out.len() - 1);
+        }
+        out
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MapRecord {
+    name: String,
+    album: String,
+    artist: String,
+    sp_id: String,
+}
+
+impl MapRecord {
+    fn matches(&self, lib_r: &LibRecord) -> bool {
+        self.name == lib_r.name && self.album == lib_r.album && self.artist == lib_r.artist
+    }
+}
+
 fn collect_csv<T: DeserializeOwned>(path: &PathBuf) -> anyhow::Result<Vec<T>> {
     let rdr = csv::Reader::from_path(path)?;
     Ok(rdr
         .into_deserialize()
         .collect::<Result<Vec<T>, csv::Error>>()?)
-}
-
-fn metadata_match(map_r: &MapRecord, lib_r: &LibRecord) -> bool {
-    map_r.name == lib_r.name && map_r.album == lib_r.album && map_r.artist == lib_r.artist
-}
-
-fn search_str(lib_r: &LibRecord) -> String {
-    let mut out = String::new();
-    if !lib_r.name.trim().is_empty() {
-        out += "track:";
-        out += &lib_r.name;
-        out += " ";
-    }
-    if !lib_r.album.trim().is_empty() {
-        out += "album:";
-        out += &lib_r.album;
-        out += " ";
-    }
-    if !lib_r.artist.trim().is_empty() {
-        out += "artist:";
-        out += &lib_r.artist;
-        out += " ";
-    }
-    if !out.is_empty() {
-        out.remove(out.len() - 1);
-    }
-    out
 }
 
 fn print_track(track: &Track) {
@@ -120,15 +136,43 @@ fn print_track(track: &Track) {
     println!("Date: {}", track.album.release_date);
 }
 
-async fn map(
-    lib_path: PathBuf,
-    map_path: PathBuf,
-    mut cred_sp: Client<Token, ClientCredsFlow, NoVerifier>,
-) -> anyhow::Result<()> {
+async fn get_cred_sp() -> anyhow::Result<Client<Token, ClientCredsFlow, NoVerifier>> {
+    let client_creds_flow =
+        ClientCredsFlow::new(CLIENT_ID, fs::read_to_string(CLIENT_SECRET_PATH)?.trim());
+    Ok(ClientCredsClient::authenticate(client_creds_flow).await?)
+}
+
+async fn get_authc_sp() -> anyhow::Result<Client<Token, AuthCodeFlow, NoVerifier>> {
+    let redirect_url = RedirectUrl::new("http://localhost/".to_owned())?;
+    let scopes = vec!["playlist-read-private", "playlist-modify-private"];
+    let auth_code_flow = AuthCodeFlow::new(
+        CLIENT_ID,
+        fs::read_to_string(CLIENT_SECRET_PATH)?.trim(),
+        scopes,
+    );
+
+    let (auth_client, url) = AuthCodeClient::new(auth_code_flow, redirect_url, true);
+    println!("Enter the following url into a browser:\n\n\t{}\n", url);
+    // TODO see if u can store the auth stuff and only refresh it if its invalid
+    // TODO use webbrowser crate to automatically open the url
+    print!("Then paste the resuting localhost url here: ");
+    io::stdout().flush()?;
+    let mut auth_url = String::new();
+    io::stdin().read_line(&mut auth_url)?;
+    println!("\n");
+    let split: Vec<&str> = auth_url.trim().split(['=', '&']).collect();
+    let auth_code = split[1].to_owned();
+    let csrf_token = split[3].to_owned();
+    Ok(auth_client.authenticate(auth_code, csrf_token).await?)
+}
+
+async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
     struct R {
         m_r: MapRecord,
         keep: bool,
     }
+    let mut cred_sp = get_cred_sp().await?;
+
     let lib: Vec<LibRecord> = collect_csv(&lib_path)?;
     let mut map: Vec<R> = if map_path.exists() {
         collect_csv(&map_path)?
@@ -142,28 +186,26 @@ async fn map(
     for (lib_index, lib_r) in lib.iter().enumerate() {
         if lib_r.name.trim().is_empty() {
             warn!(
-                "line {lib_index} in {} has empty Name field",
+                "line {} in {} has empty Name field",
+                lib_index + 1,
                 lib_path.file_name().unwrap().to_string_lossy()
             );
             continue;
         }
         // if lib_r already present in map
-        if let Some(map_r) = map
-            .iter_mut()
-            .find(|map_r| metadata_match(&map_r.m_r, &lib_r))
-        {
+        if let Some(r) = map.iter_mut().find(|r| r.m_r.matches(lib_r)) {
+            r.keep = true;
             info!(
-                "line {lib_index}, \"{}\" already present in map",
-                map_r.m_r.name
+                "line {}, \"{}\" already present in map",
+                lib_index + 1,
+                r.m_r.name
             );
-            map_r.keep = true;
             continue;
         }
         // else add lib_r to map
         // TODO is there an error if the query contains a colon? (generally do we/how do we escape stuff)
-        // TODO info abt searching
         let search_results = cred_sp
-            .search(search_str(&lib_r), &[Item::Track])
+            .search(lib_r.search_str(), &[Item::Track])
             .market("GB")
             .limit(5)
             .get()
@@ -175,11 +217,18 @@ async fn map(
                 m_r: lib_r.to_map_record("Not found"),
                 keep: true,
             });
-            warn!("line {lib_index}, \"{}\" not found on spotify", lib_r.name);
+            warn!(
+                "line {}, \"{}\" not found by spotify search",
+                lib_index + 1,
+                lib_r.name
+            );
             continue;
         }
+        println!("== Track to match ==");
+        println!("{lib_r}\n");
+        println!("== Search results ==");
         for (i, item) in search_results.items.iter().enumerate() {
-            println!("Search result {}", i + 1);
+            println!("= Search result {} =", i + 1);
             print_track(item);
             println!();
         }
@@ -194,21 +243,42 @@ async fn map(
                 m_r: lib_r.to_map_record("Not found"),
                 keep: true,
             });
+            info!(
+                "line {}, \"{}\" added as \"Not found\"",
+                lib_index + 1,
+                lib_r.name,
+            );
             continue;
         }
         let index = answer.parse::<usize>()? - 1;
-        // TODO info abt this
         map.push(R {
             m_r: lib_r.to_map_record(search_results.items[index].id.clone()),
             keep: true,
         });
+        info!(
+            "line {}, \"{}\" added with id: {}",
+            lib_index + 1,
+            lib_r.name,
+            search_results.items[index].id.clone()
+        );
     }
 
     // Remove entries from map that are not present in lib
-    // TODO warn abt these
     let mut map: Vec<MapRecord> = map
         .into_iter()
-        .filter_map(|m_r| if m_r.keep { Some(m_r.m_r) } else { None })
+        .enumerate()
+        .filter_map(|(map_index, r)| {
+            if r.keep {
+                Some(r.m_r)
+            } else {
+                warn!(
+                    "line {}, \"{}\" removed from map as not present in lib",
+                    map_index + 1,
+                    r.m_r.name
+                );
+                None
+            }
+        })
         .collect();
     map.sort_by_key(|m_r| m_r.name.clone());
     map.sort_by_key(|m_r| m_r.album.clone());
@@ -222,63 +292,30 @@ async fn map(
     Ok(())
 }
 
-async fn check(
-    _map_path: PathBuf,
-    _cred_sp: Client<Token, ClientCredsFlow, NoVerifier>,
-) -> anyhow::Result<()> {
+async fn check(_map_path: PathBuf) -> anyhow::Result<()> {
     // let map: Vec<MapRecord> = collect_csv(&map_path)?;
+    // let mut cred_sp = get_cred_sp().await?;
     todo!()
 }
 
-async fn upload(
-    _map_path: PathBuf,
-    _cred_sp: Client<Token, ClientCredsFlow, NoVerifier>,
-    _authc_sp: Client<Token, AuthCodeFlow, NoVerifier>,
-) -> anyhow::Result<()> {
+async fn upload(_map_path: PathBuf) -> anyhow::Result<()> {
     // let map: Vec<MapRecord> = collect_csv(&map_path)?;
+    // let mut cred_sp = get_cred_sp().await?;
+    // let mut authc_sp = get_authc_sp().await?;
     todo!()
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    colog::init();
     // TODO make errors not look like ass
+    // TODO maybe use console, dialoguer and indicatif crates
+
+    colog::init();
     let cli = Cli::parse();
-
-    let redirect_url = RedirectUrl::new("http://localhost/".to_owned())?;
-    let auto_refresh = true;
-    let scopes = vec!["playlist-read-private", "playlist-modify-private"];
-    let auth_code_flow = AuthCodeFlow::new(
-        "fed3e6de8e3e4fe481b4020cdb72342e",
-        fs::read_to_string("client_secret.txt")?.trim(),
-        scopes,
-    );
-
-    let client_creds_flow = ClientCredsFlow::new(
-        "fed3e6de8e3e4fe481b4020cdb72342e",
-        fs::read_to_string("client_secret.txt")?.trim(),
-    );
-    let cred_sp = ClientCredsClient::authenticate(client_creds_flow).await?;
-
-    let (auth_client, url) = AuthCodeClient::new(auth_code_flow, redirect_url, auto_refresh);
-    println!("Enter the following url into a browser:\n\n\t{}\n", url);
-    // TODO store the auth stuff and only refresh it if its invalid
-    // TODO use webbrowser crate to automatically open the url
-    print!("Then paste the resuting localhost url here: ");
-    io::stdout().flush()?;
-    let mut auth_url = String::new();
-    io::stdin().read_line(&mut auth_url)?;
-    println!("\n");
-    let split: Vec<&str> = auth_url.trim().split(['=', '&']).collect();
-    let auth_code = split[1].to_owned();
-    let csrf_token = split[3].to_owned();
-    let authc_sp = auth_client.authenticate(auth_code, csrf_token).await?;
-
-    // TODO use console, dialoguer and indicatif crates
     match cli.command {
-        Commands::Map { lib_path, map_path } => map(lib_path, map_path, cred_sp).await,
-        Commands::Check { map_path } => check(map_path, cred_sp).await,
-        Commands::Upload { map_path } => upload(map_path, cred_sp, authc_sp).await,
+        Commands::Map { lib_path, map_path } => map(lib_path, map_path).await,
+        Commands::Check { map_path } => check(map_path).await,
+        Commands::Upload { map_path } => upload(map_path).await,
     }?;
     Ok(())
 }
