@@ -154,7 +154,7 @@ async fn get_authc_sp() -> anyhow::Result<Client<Token, AuthCodeFlow, NoVerifier
     let (auth_client, url) = AuthCodeClient::new(auth_code_flow, redirect_url, true);
     println!("Enter the following url into a browser:\n\n\t{}\n", url);
     // TODO see if u can store the auth stuff and only refresh it if its invalid
-    // TODO use webbrowser crate to automatically open the url
+    // TODO use webbrowser crate to automatically open the url or make an http request directly
     print!("Then paste the resuting localhost url here: ");
     io::stdout().flush()?;
     let mut auth_url = String::new();
