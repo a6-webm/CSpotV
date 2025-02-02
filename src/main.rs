@@ -7,17 +7,23 @@ use std::{
 
 use anyhow::Context;
 use clap::{command, Parser, Subcommand};
-use log::{info, warn};
+use log::{error, info, warn};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use spotify_rs::{
     auth::{NoVerifier, Token},
     client::Client,
-    model::{search::Item, track::Track},
+    model::{search::Item, track::Track, PlayableItem},
     AuthCodeClient, AuthCodeFlow, ClientCredsClient, ClientCredsFlow, RedirectUrl,
 };
 
 const CLIENT_ID: &str = "fed3e6de8e3e4fe481b4020cdb72342e";
 const CLIENT_SECRET_PATH: &str = "client_secret.txt";
+
+struct Tr {
+    name: String,
+    id: String,
+    pos: u32,
+}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -45,6 +51,9 @@ enum Commands {
         /// .csv file containing mappings from songs to spotify songs
         #[arg(value_name = "MAP_FILE")]
         map_path: PathBuf,
+        /// id of the playlist you want to update
+        #[arg(value_name = "PLAYLIST_ID")]
+        playlist_id: String,
     },
 }
 
@@ -66,12 +75,12 @@ impl Display for LibRecord {
 }
 
 impl LibRecord {
-    fn to_map_record<T: Into<String>>(&self, sp_id: T) -> MapRecord {
+    fn to_map_record(&self, sp_id: &str) -> MapRecord {
         MapRecord {
             name: self.name.to_owned(),
             album: self.album.to_owned(),
             artist: self.artist.to_owned(),
-            sp_id: sp_id.into(),
+            sp_id: sp_id.to_owned(),
         }
     }
 
@@ -144,7 +153,11 @@ async fn get_cred_sp() -> anyhow::Result<Client<Token, ClientCredsFlow, NoVerifi
 
 async fn get_authc_sp() -> anyhow::Result<Client<Token, AuthCodeFlow, NoVerifier>> {
     let redirect_url = RedirectUrl::new("http://localhost/".to_owned())?;
-    let scopes = vec!["playlist-read-private", "playlist-modify-private"];
+    let scopes = vec![
+        "playlist-read-private",
+        "playlist-modify-private",
+        "playlist-modify-public",
+    ];
     let auth_code_flow = AuthCodeFlow::new(
         CLIENT_ID,
         fs::read_to_string(CLIENT_SECRET_PATH)?.trim(),
@@ -154,7 +167,7 @@ async fn get_authc_sp() -> anyhow::Result<Client<Token, AuthCodeFlow, NoVerifier
     let (auth_client, url) = AuthCodeClient::new(auth_code_flow, redirect_url, true);
     println!("Enter the following url into a browser:\n\n\t{}\n", url);
     // TODO see if u can store the auth stuff and only refresh it if its invalid
-    // TODO use webbrowser crate to automatically open the url or make an http request directly
+    // TODO host a page with hyper, open the url with webbrowser, and get the auth automatically
     print!("Then paste the resuting localhost url here: ");
     io::stdout().flush()?;
     let mut auth_url = String::new();
@@ -167,6 +180,7 @@ async fn get_authc_sp() -> anyhow::Result<Client<Token, AuthCodeFlow, NoVerifier
 }
 
 async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
+    // TODO redo this so that it writes stuff to a tmp file so u can resume later if u abort
     struct R {
         m_r: MapRecord,
         keep: bool,
@@ -186,7 +200,7 @@ async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
     for (lib_index, lib_r) in lib.iter().enumerate() {
         if lib_r.name.trim().is_empty() {
             warn!(
-                "line {} in {} has empty Name field",
+                "line {} in {} has empty Name field, skipping...",
                 lib_index + 1,
                 lib_path.file_name().unwrap().to_string_lossy()
             );
@@ -252,7 +266,7 @@ async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
         }
         let index = answer.parse::<usize>()? - 1;
         map.push(R {
-            m_r: lib_r.to_map_record(search_results.items[index].id.clone()),
+            m_r: lib_r.to_map_record(&search_results.items[index].id),
             keep: true,
         });
         info!(
@@ -272,7 +286,7 @@ async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
                 Some(r.m_r)
             } else {
                 warn!(
-                    "line {}, \"{}\" removed from map as not present in lib",
+                    "map line {}, \"{}\" removed as not present in lib",
                     map_index + 1,
                     r.m_r.name
                 );
@@ -292,17 +306,138 @@ async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn check(_map_path: PathBuf) -> anyhow::Result<()> {
-    // let map: Vec<MapRecord> = collect_csv(&map_path)?;
-    // let mut cred_sp = get_cred_sp().await?;
-    todo!()
+async fn check(map_path: PathBuf) -> anyhow::Result<()> {
+    let map: Vec<MapRecord> = collect_csv(&map_path)?;
+    let mut cred_sp = get_cred_sp().await?;
+
+    for (ind, m_r) in map.iter().enumerate() {
+        if m_r.sp_id == "Not found" {
+            warn!("line {}, \"{}\" has id \"Not found\"", ind + 1, m_r.name);
+        } else if cred_sp.track(&m_r.sp_id).get().await.is_err() {
+            error!(
+                "line {}, \"{}\" has invalid id \"{}\"",
+                ind + 1,
+                m_r.name,
+                m_r.sp_id
+            );
+        }
+    }
+    Ok(())
 }
 
-async fn upload(_map_path: PathBuf) -> anyhow::Result<()> {
-    // let map: Vec<MapRecord> = collect_csv(&map_path)?;
-    // let mut cred_sp = get_cred_sp().await?;
-    // let mut authc_sp = get_authc_sp().await?;
-    todo!()
+async fn get_all_playlist_tracks(
+    authc_sp: &mut Client<Token, AuthCodeFlow, NoVerifier>,
+    playlist_id: &str,
+) -> anyhow::Result<Vec<Tr>> {
+    let mut playlist_items = Vec::new();
+    let limit: u32 = 50;
+    let total = authc_sp.playlist_items(playlist_id).get().await?.total;
+    for offset in (0..total).step_by(limit as usize) {
+        let page = authc_sp
+            .playlist_items(playlist_id)
+            .limit(limit)
+            .offset(offset)
+            .get()
+            .await?;
+        page.items
+            .into_iter()
+            .enumerate()
+            .map(|(ind, pi)| match pi.track {
+                PlayableItem::Track(track) => Tr {
+                    name: track.name,
+                    id: track.id,
+                    pos: offset + ind as u32,
+                },
+                PlayableItem::Episode(_) => Tr {
+                    name: String::new(),
+                    id: String::from("episode"),
+                    pos: offset + ind as u32,
+                },
+            })
+            .for_each(|id| playlist_items.push(id));
+    }
+    Ok(playlist_items)
+}
+
+async fn upload(map_path: PathBuf, playlist_id: &str) -> anyhow::Result<()> {
+    struct R {
+        m_r: MapRecord,
+        in_pl: bool,
+    }
+    let mut map: Vec<R> = if map_path.exists() {
+        collect_csv(&map_path)?
+            .into_iter()
+            .map(|m_r| R { m_r, in_pl: false })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut authc_sp = get_authc_sp().await?;
+
+    let playlist = get_all_playlist_tracks(&mut authc_sp, playlist_id).await?;
+
+    let mut to_remove: Vec<String> = Vec::new();
+    for pl_tr in playlist {
+        if let Some(r) = map.iter_mut().find(|r| r.m_r.sp_id == pl_tr.id) {
+            r.in_pl = true;
+        } else {
+            to_remove.push(String::from("spotify:track:") + &pl_tr.id);
+            info!(
+                "playlist item {}, \"{}\" not in map, will remove from playlist",
+                pl_tr.pos + 1,
+                pl_tr.name,
+            );
+        }
+    }
+
+    let to_add: Vec<String> = map
+        .into_iter()
+        .enumerate()
+        .filter_map(|(map_ind, R { m_r, in_pl })| {
+            if in_pl || m_r.sp_id == "Not found" {
+                None
+            } else {
+                info!(
+                    "map line {}, \"{}\" not in playlist, will add to playlist",
+                    map_ind + 1,
+                    m_r.name
+                );
+                Some(String::from("spotify:track:") + &m_r.sp_id)
+            }
+        })
+        .collect();
+
+    if to_add.is_empty() && to_remove.is_empty() {
+        info!("Nothing to change, quitting...");
+        return Ok(());
+    }
+
+    print!("Proceed? (y/N): ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim().to_lowercase() != "y" {
+        info!("Aborting upload...");
+        return Ok(());
+    }
+
+    const SEND_LIM: usize = 100;
+    for chunk in to_remove.chunks(SEND_LIM) {
+        info!("Removing...");
+        authc_sp
+            .remove_playlist_items(playlist_id, chunk)
+            .send()
+            .await?;
+    }
+    for chunk in to_add.chunks(SEND_LIM) {
+        info!("Adding...");
+        authc_sp
+            .add_items_to_playlist(playlist_id, chunk)
+            .send()
+            .await?;
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -315,7 +450,10 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Map { lib_path, map_path } => map(lib_path, map_path).await,
         Commands::Check { map_path } => check(map_path).await,
-        Commands::Upload { map_path } => upload(map_path).await,
+        Commands::Upload {
+            map_path,
+            playlist_id,
+        } => upload(map_path, &playlist_id).await,
     }?;
     Ok(())
 }
