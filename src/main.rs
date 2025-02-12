@@ -152,7 +152,7 @@ async fn get_cred_sp() -> anyhow::Result<Client<Token, ClientCredsFlow, NoVerifi
 }
 
 async fn get_authc_sp() -> anyhow::Result<Client<Token, AuthCodeFlow, NoVerifier>> {
-    let redirect_url = RedirectUrl::new("http://localhost/".to_owned())?;
+    let redirect_url = RedirectUrl::new("http://127.0.0.1".to_owned())?;
     let scopes = vec![
         "playlist-read-private",
         "playlist-modify-private",
