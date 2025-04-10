@@ -10,6 +10,13 @@ takes a csv of songs from your library and a (potentially non-existant) mapping 
 any library song missing in the mapping is added. A spotify song id is attempted to be found, but if not it needs to be added manually afterwards
 any mapping missing from the library is removed
 
+#### new temp plan
+lib -> map with some id
+skip cause bad entry
+skip cause lib present in map
+
+for loop each map entry, if not in lib then delete it
+
 ### check
 takes a mapping csv, marks defunct spotify song id's with a flag
 
