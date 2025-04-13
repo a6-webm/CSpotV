@@ -4,12 +4,12 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use log::{info, warn};
 use spotify_rs::model::search::Item;
 
 use crate::{
-    collect_csv,
+    ask, collect_csv,
     spotify::{get_cred_sp, print_track},
     LibRec, MapRec,
 };
@@ -23,10 +23,14 @@ struct ProgMap {
 impl ProgMap {
     fn new(prog_path: &PathBuf, lib_path: &PathBuf) -> anyhow::Result<Self> {
         let prog_file = if prog_path.exists() {
-            // TODO ask if they'd like to resume the mapping restoring from the backup before actually doing it
-            let mut prog_file = File::options().write(true).open(prog_path)?;
-            prog_file.seek(io::SeekFrom::End(0))?;
-            prog_file
+            let answer = ask("In progress search detected, would you like to continue from this backup? (if not, this will overwrite the backup file)[Y/n]:", &["y", "n", ""])?;
+            if answer == "n" {
+                File::create(prog_path)?
+            } else {
+                let mut prog_file = File::options().write(true).open(prog_path)?;
+                prog_file.seek(io::SeekFrom::End(0))?;
+                prog_file
+            }
         } else {
             File::create(prog_path)?
         };
@@ -136,7 +140,6 @@ pub async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
     };
 
     let mut prog_map = ProgMap::new(&prog_path, &lib_path)?;
-    dbg!(&prog_map.recs);
     while prog_map.index() < lib.len() {
         let lib_r = lib[prog_map.index()].clone();
         if lib_r.name.trim().is_empty() {
@@ -150,7 +153,7 @@ pub async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
         }
         // else add lib_r to map
         let search_results = cred_sp
-            .search(dbg!(lib_r.search_str()), &[Item::Track])
+            .search(lib_r.search_str(), &[Item::Track])
             .market("GB")
             .limit(5)
             .get()
@@ -239,11 +242,23 @@ pub async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
     map.sort_by_key(|m_r| m_r.artist.clone());
 
     // TODO make this safer by writing to a tmp file then using mv
-    let mut wtr = csv::Writer::from_path(&map_path)?;
+    let temp_map_path = {
+        let mut file_name = map_path.file_name().unwrap().to_owned();
+        file_name.push(".tmp");
+        PathBuf::from(file_name)
+    };
+    if temp_map_path.exists() {
+        return Err(anyhow!(format!(
+            "Path {} already exists",
+            temp_map_path.to_string_lossy()
+        )));
+    }
+    let mut wtr = csv::Writer::from_path(&temp_map_path)?;
     for map_r in map.into_iter() {
         wtr.serialize(map_r)?;
     }
     wtr.flush()?;
+    fs::rename(temp_map_path, map_path)?;
     fs::remove_file(prog_path)?;
     Ok(())
 }

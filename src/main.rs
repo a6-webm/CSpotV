@@ -5,7 +5,7 @@ use spotify::{get_all_playlist_tracks, get_authc_sp, get_cred_sp};
 use spotify_rs::model::track::Track;
 use std::{
     fmt::Display,
-    io::{self, Write},
+    io::{self, stdin, stdout, Write},
     path::PathBuf,
 };
 
@@ -114,6 +114,22 @@ struct MapRec {
 impl MapRec {
     fn matches(&self, lib_r: &LibRec) -> bool {
         self.name == lib_r.name && self.album == lib_r.album && self.artist == lib_r.artist
+    }
+}
+
+fn ask<S: AsRef<str>>(question: &str, possible_answers: &[S]) -> anyhow::Result<String> {
+    let mut answer = String::new();
+    loop {
+        print!("{}", question);
+        stdout().flush()?;
+        stdin().read_line(&mut answer)?;
+        let t_answer = answer.trim().to_lowercase();
+        for a in possible_answers {
+            if a.as_ref() == t_answer {
+                return Ok(t_answer.to_owned());
+            }
+        }
+        answer = String::new();
     }
 }
 
