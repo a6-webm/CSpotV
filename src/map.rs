@@ -17,7 +17,7 @@ use tokio::time::sleep;
 
 use crate::{
     ask, collect_csv,
-    spotify::{get_cred_sp, print_track},
+    spotify::{get_cred_sp, print_track, search_str},
     LibRec, MapRec,
 };
 
@@ -129,30 +129,66 @@ enum Prog {
     MissingName,
 }
 
+// TODO if search returns no results, gradually widen the search parameters ideally until you have 5 results
 async fn search_tracks(
     lib_r: &LibRec,
     cred_sp: &mut Client<Token, ClientCredsFlow, NoVerifier>,
 ) -> anyhow::Result<Vec<Track>> {
-    loop {
-        let search = cred_sp
-            .search(lib_r.search_str(), &[Item::Track])
-            .market("GB")
-            .limit(5)
-            .get()
-            .await;
+    let mut res = vec![];
+    let mut search_lvl = 0;
+    while res.len() < 5 && search_lvl <= 2 {
+        let search = match search_lvl {
+            0 => {
+                cred_sp
+                    .search(lib_r.search_str(), &[Item::Track])
+                    .market("GB")
+                    .limit(5)
+                    .get()
+                    .await
+            }
+            1 => {
+                cred_sp
+                    .search(
+                        search_str(&lib_r.name, "", &lib_r.album, ""),
+                        &[Item::Track],
+                    )
+                    .market("GB")
+                    .limit(5)
+                    .get()
+                    .await
+            }
+            2 => {
+                let mut s_str = String::new();
+                s_str += &lib_r.name;
+                s_str += " ";
+                s_str += &lib_r.artist;
+                cred_sp
+                    .search(search_str(&s_str, "", "", ""), &[Item::Track])
+                    .market("GB")
+                    .limit(5)
+                    .get()
+                    .await
+            }
+            _ => unreachable!(),
+        };
         if let Err(spotify_rs::Error::Spotify {
             status: 429, // rate limiting
             message: _,
         }) = search
         {
-            sleep(Duration::from_secs(1)).await
+            sleep(Duration::from_secs(1)).await;
+            continue;
         } else {
-            return Ok(search?
+            let mut new_res = search?
                 .tracks
                 .with_context(|| "spotify search failed")?
-                .items);
+                .items;
+            res.append(&mut new_res);
         }
+        search_lvl += 1;
     }
+    res.truncate(5);
+    Ok(res)
 }
 
 pub async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
@@ -197,41 +233,52 @@ pub async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
             ))?;
             continue;
         }
-        println!("== Track to match ==");
+        println!("=== Track to match ==============================");
         println!("{lib_r}\n");
-        println!("== Search results ==");
+        println!("=== Search results ====================");
         for (i, item) in search_results.iter().enumerate() {
             println!("= Search result {} =", i + 1);
             print_track(item);
             println!();
         }
         let tracks_len = search_results.len();
-        let answer = (|| -> anyhow::Result<Option<usize>> {
+        enum Ans {
+            NotFound,
+            Ind(usize),
+            Manual(String),
+        }
+        let answer = (|| -> anyhow::Result<Ans> {
             let mut answer = String::new();
             loop {
-                print!("Pick a track to match (#/n): ");
+                print!("Pick a track to match (#/s/n): ");
                 io::stdout().flush()?;
                 io::stdin().read_line(&mut answer)?;
                 answer = answer.trim().to_lowercase();
                 if answer == "n" {
-                    return Ok(None);
+                    return Ok(Ans::NotFound);
+                }
+                if answer == "s" {
+                    print!("Please manually enter the spotify id: ");
+                    answer = String::new();
+                    io::stdout().flush()?;
+                    io::stdin().read_line(&mut answer)?;
+                    return Ok(Ans::Manual(answer.trim().to_owned()));
                 }
                 if let Ok(i) = answer.parse::<usize>() {
                     if i > 0 && i < tracks_len + 1 {
-                        return Ok(Some(i));
+                        return Ok(Ans::Ind(i));
                     }
                 }
                 answer = String::new();
             }
         })()?;
-        if answer.is_none() {
-            prog_map.push_rec(Prog::RejectedSearch(lib_r))?;
-            continue;
+        match answer {
+            Ans::NotFound => prog_map.push_rec(Prog::RejectedSearch(lib_r))?,
+            Ans::Ind(index) => prog_map.push_rec(Prog::ChosenSearch(
+                lib_r.to_map_record(&search_results[index - 1].id),
+            ))?,
+            Ans::Manual(id) => prog_map.push_rec(Prog::ChosenSearch(lib_r.to_map_record(&id)))?,
         }
-        let index = answer.unwrap();
-        prog_map.push_rec(Prog::ChosenSearch(
-            lib_r.to_map_record(&search_results[index - 1].id),
-        ))?;
     }
 
     // my fweaking GIWLFWIEND made me write this comment :P
@@ -264,7 +311,6 @@ pub async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
     map.sort_by_key(|m_r| m_r.album.clone());
     map.sort_by_key(|m_r| m_r.artist.clone());
 
-    // TODO make this safer by writing to a tmp file then using mv
     let temp_map_path = {
         let mut file_name = map_path.file_name().unwrap().to_owned();
         file_name.push(".tmp");

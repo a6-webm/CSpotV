@@ -2,13 +2,15 @@ use clap::{command, Parser, Subcommand};
 use lib_gen::gen_lib;
 use log::{error, info, warn};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use spotify::{get_all_playlist_tracks, get_authc_sp, get_cred_sp};
+use spotify::{get_all_playlist_tracks, get_authc_sp, get_cred_sp, search_str};
 use spotify_rs::model::track::Track;
 use std::{
     fmt::Display,
     io::{self, stdin, stdout, Write},
     path::PathBuf,
+    time::Duration,
 };
+use tokio::time::sleep;
 
 mod lib_gen;
 mod map;
@@ -90,27 +92,9 @@ impl LibRec {
                 .any(|at| at.name.trim().to_lowercase() == self.artist.trim().to_lowercase());
     }
 
+    // TODO double check that colon searching actually works
     fn search_str(&self) -> String {
-        let mut out = String::new();
-        if !self.name.trim().is_empty() {
-            out += "track:";
-            out += &self.name.replace(" ", "+");
-            out += " ";
-        }
-        if !self.album.trim().is_empty() {
-            out += "album:";
-            out += &self.album.replace(" ", "+");
-            out += " ";
-        }
-        if !self.artist.trim().is_empty() {
-            out += "artist:";
-            out += &self.artist.replace(" ", "+");
-            out += " ";
-        }
-        if !out.is_empty() {
-            out.remove(out.len() - 1);
-        }
-        out
+        search_str("", &self.name, &self.album, &self.artist)
     }
 }
 
@@ -159,14 +143,27 @@ async fn check(map_path: PathBuf) -> anyhow::Result<()> {
 
     for (ind, m_r) in map.iter().enumerate() {
         if m_r.sp_id == "Not found" {
-            warn!("line {}, \"{}\" has id \"Not found\"", ind + 1, m_r.name);
-        } else if cred_sp.track(&m_r.sp_id).get().await.is_err() {
-            error!(
-                "line {}, \"{}\" has invalid id \"{}\"",
-                ind + 1,
-                m_r.name,
-                m_r.sp_id
-            );
+            continue;
+        }
+        loop {
+            match cred_sp.track(&m_r.sp_id).get().await {
+                Ok(_) => break,
+                Err(spotify_rs::Error::Spotify {
+                    status: 429, // rate limiting
+                    message: _,
+                }) => {
+                    sleep(Duration::from_secs(1)).await;
+                }
+                Err(_) => {
+                    error!(
+                        "line {}, \"{}\" has invalid id \"{}\"",
+                        ind + 1,
+                        m_r.name,
+                        m_r.sp_id
+                    );
+                    break;
+                }
+            }
         }
     }
     Ok(())
@@ -237,17 +234,41 @@ async fn upload(map_path: PathBuf, playlist_id: &str) -> anyhow::Result<()> {
     const SEND_LIM: usize = 100;
     for chunk in to_remove.chunks(SEND_LIM) {
         info!("Removing...");
-        authc_sp
-            .remove_playlist_items(playlist_id, chunk)
-            .send()
-            .await?;
+        loop {
+            let res = authc_sp
+                .remove_playlist_items(playlist_id, chunk)
+                .send()
+                .await;
+            if let Err(spotify_rs::Error::Spotify {
+                status: 429, // rate limiting
+                message: _,
+            }) = res
+            {
+                sleep(Duration::from_secs(1)).await;
+            } else {
+                res?;
+                break;
+            }
+        }
     }
     for chunk in to_add.chunks(SEND_LIM) {
         info!("Adding...");
-        authc_sp
-            .add_items_to_playlist(playlist_id, chunk)
-            .send()
-            .await?;
+        loop {
+            let res = authc_sp
+                .add_items_to_playlist(playlist_id, chunk)
+                .send()
+                .await;
+            if let Err(spotify_rs::Error::Spotify {
+                status: 429, // rate limiting
+                message: _,
+            }) = res
+            {
+                sleep(Duration::from_secs(1)).await;
+            } else {
+                res?;
+                break;
+            }
+        }
     }
 
     info!("Upload complete");
@@ -260,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
     // TODO make errors not look like ass
     // TODO maybe use console, dialoguer and indicatif crates
     // TODO prevent rate limiting errors from breaking things
+    // TODO refresh token if it expires
 
     colog::init();
     let cli = Cli::parse();

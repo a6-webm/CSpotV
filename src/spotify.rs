@@ -19,6 +19,33 @@ pub struct Tr {
     pub pos: u32,
 }
 
+pub fn search_str(q: &str, track: &str, album: &str, artist: &str) -> String {
+    let mut out = String::new();
+    if !q.trim().is_empty() {
+        out += &q.replace(" ", "+");
+        out += " ";
+    }
+    if !track.trim().is_empty() {
+        out += "track:";
+        out += &track.replace(" ", "+");
+        out += " ";
+    }
+    if !album.trim().is_empty() {
+        out += "album:";
+        out += &album.replace(" ", "+");
+        out += " ";
+    }
+    if !artist.trim().is_empty() {
+        out += "artist:";
+        out += &artist.replace(" ", "+");
+        out += " ";
+    }
+    if !out.is_empty() {
+        out.remove(out.len() - 1);
+    }
+    out
+}
+
 pub fn print_track(track: &Track) {
     println!("Name: {}", track.name);
     println!("Album: {}", track.album.name);
