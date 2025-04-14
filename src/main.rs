@@ -84,9 +84,10 @@ impl LibRec {
     fn matches_track(&self, tr: &Track) -> bool {
         return self.name.trim().to_lowercase() == tr.name.trim().to_lowercase()
             && self.album.trim().to_lowercase() == tr.album.name.trim().to_lowercase()
-            && tr.artists.first().map_or(false, |a| {
-                a.name.trim().to_lowercase() == self.artist.trim().to_lowercase()
-            });
+            && tr
+                .artists
+                .iter()
+                .any(|at| at.name.trim().to_lowercase() == self.artist.trim().to_lowercase());
     }
 
     fn search_str(&self) -> String {
@@ -258,6 +259,7 @@ async fn upload(map_path: PathBuf, playlist_id: &str) -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     // TODO make errors not look like ass
     // TODO maybe use console, dialoguer and indicatif crates
+    // TODO prevent rate limiting errors from breaking things
 
     colog::init();
     let cli = Cli::parse();

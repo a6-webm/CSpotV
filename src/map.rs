@@ -2,11 +2,18 @@ use std::{
     fs::{self, File},
     io::{self, Seek, Write},
     path::PathBuf,
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context};
 use log::{info, warn};
-use spotify_rs::model::search::Item;
+use spotify_rs::{
+    auth::{NoVerifier, Token},
+    client::Client,
+    model::{search::Item, track::Track},
+    ClientCredsFlow,
+};
+use tokio::time::sleep;
 
 use crate::{
     ask, collect_csv,
@@ -122,6 +129,32 @@ enum Prog {
     MissingName,
 }
 
+async fn search_tracks(
+    lib_r: &LibRec,
+    cred_sp: &mut Client<Token, ClientCredsFlow, NoVerifier>,
+) -> anyhow::Result<Vec<Track>> {
+    loop {
+        let search = cred_sp
+            .search(lib_r.search_str(), &[Item::Track])
+            .market("GB")
+            .limit(5)
+            .get()
+            .await;
+        if let Err(spotify_rs::Error::Spotify {
+            status: 429, // rate limiting
+            message: _,
+        }) = search
+        {
+            sleep(Duration::from_secs(1)).await
+        } else {
+            return Ok(search?
+                .tracks
+                .with_context(|| "spotify search failed")?
+                .items);
+        }
+    }
+}
+
 pub async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
     let mut cred_sp = get_cred_sp().await?;
 
@@ -153,23 +186,12 @@ pub async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
         }
         // else add lib_r to map
         // TODO let user choose market
-        let search_results = cred_sp
-            .search(lib_r.search_str(), &[Item::Track])
-            .market("GB")
-            .limit(5)
-            .get()
-            .await?
-            .tracks
-            .with_context(|| "spotify search failed")?;
-        if search_results.items.is_empty() {
+        let search_results = search_tracks(&lib_r, &mut cred_sp).await?;
+        if search_results.is_empty() {
             prog_map.push_rec(Prog::NotFoundSearch(lib_r))?;
             continue;
         }
-        if let Some(track) = search_results
-            .items
-            .iter()
-            .find(|tr| lib_r.matches_track(tr))
-        {
+        if let Some(track) = search_results.iter().find(|tr| lib_r.matches_track(tr)) {
             prog_map.push_rec(Prog::AutomaticallyChosenSearch(
                 lib_r.to_map_record(&track.id),
             ))?;
@@ -178,12 +200,12 @@ pub async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
         println!("== Track to match ==");
         println!("{lib_r}\n");
         println!("== Search results ==");
-        for (i, item) in search_results.items.iter().enumerate() {
+        for (i, item) in search_results.iter().enumerate() {
             println!("= Search result {} =", i + 1);
             print_track(item);
             println!();
         }
-        let tracks_len = search_results.items.len();
+        let tracks_len = search_results.len();
         let answer = (|| -> anyhow::Result<Option<usize>> {
             let mut answer = String::new();
             loop {
@@ -208,7 +230,7 @@ pub async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
         }
         let index = answer.unwrap();
         prog_map.push_rec(Prog::ChosenSearch(
-            lib_r.to_map_record(&search_results.items[index - 1].id),
+            lib_r.to_map_record(&search_results[index - 1].id),
         ))?;
     }
 
