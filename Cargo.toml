@@ -11,4 +11,5 @@ csv = "1.3.1"
 log = "0.4.25"
 serde = { version = "1.0.217", features = ["derive"] }
 spotify-rs = "0.3.14"
+symphonia = { version="0.5.4", features = ["all-codecs", "all-formats"] }
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread"] }

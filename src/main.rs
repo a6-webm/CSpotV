@@ -1,4 +1,5 @@
 use clap::{command, Parser, Subcommand};
+use lib_gen::gen_lib;
 use log::{error, info, warn};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use spotify::{get_all_playlist_tracks, get_authc_sp, get_cred_sp};
@@ -9,6 +10,7 @@ use std::{
     path::PathBuf,
 };
 
+mod lib_gen;
 mod map;
 mod spotify;
 
@@ -21,6 +23,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Lib {
+        /// path to your music files
+        #[arg(value_name = "MUSIC_DIR")]
+        music_path: PathBuf,
+        /// .csv file that will contain songs from your library
+        #[arg(value_name = "LIBRARY_FILE")]
+        lib_path: PathBuf,
+    },
     Map {
         /// .csv file containing songs from your library
         #[arg(value_name = "LIBRARY_FILE")]
@@ -44,7 +54,7 @@ enum Commands {
     },
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct LibRec {
     name: String,
     album: String,
@@ -252,6 +262,10 @@ async fn main() -> anyhow::Result<()> {
     colog::init();
     let cli = Cli::parse();
     match cli.command {
+        Commands::Lib {
+            music_path,
+            lib_path,
+        } => gen_lib(music_path, lib_path),
         Commands::Map { lib_path, map_path } => map::map(lib_path, map_path).await,
         Commands::Check { map_path } => check(map_path).await,
         Commands::Upload {
