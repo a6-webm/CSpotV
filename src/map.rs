@@ -152,6 +152,7 @@ pub async fn map(lib_path: PathBuf, map_path: PathBuf) -> anyhow::Result<()> {
             continue;
         }
         // else add lib_r to map
+        // TODO let user choose market
         let search_results = cred_sp
             .search(lib_r.search_str(), &[Item::Track])
             .market("GB")
